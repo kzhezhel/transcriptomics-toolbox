@@ -10,31 +10,37 @@ __pycache__/
 *.pyo
 *.pyd
 
-# IDE settings
+# IDE
 .vscode/
 .idea/
 *.iml
 .DS_Store
 
-# Data files (не загружайте большие файлы!)
+# Data 
 *.h5
+*.h5ad
+*.h5ad.zip
+*.h5seurat
+*.mtx.gz
+*.tsv.gz
 *.tar.gz
 *.gz
-*.h5ad
 spatial/
 data/
-*.png
-*.jpg
-*.jpeg
+reference/
+raw_data/
 
-# Generated HTML reports (если не хотите хранить их в репозитории)
+# Outputs
+nnls_deconvolution_full.html
+three_islands_*.html
 *.html
+*_deconvolved_nnls.h5ad
 
-# Jupyter notebooks (если есть)
+# Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# pytest, coverage
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
