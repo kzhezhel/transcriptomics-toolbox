@@ -1,0 +1,40 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE settings
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# Data files (не загружайте большие файлы!)
+*.h5
+*.tar.gz
+*.gz
+*.h5ad
+spatial/
+data/
+*.png
+*.jpg
+*.jpeg
+
+# Generated HTML reports (если не хотите хранить их в репозитории)
+*.html
+
+# Jupyter notebooks (если есть)
+.ipynb_checkpoints/
+*.ipynb
+
+# pytest, coverage
+.pytest_cache/
+.coverage
+htmlcov/
