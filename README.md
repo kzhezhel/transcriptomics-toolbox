@@ -5,7 +5,7 @@ Interactive spatial transcriptomics dashboard for Visium data with cluster/gene 
 
 ## About
 
-A self-contained HTML report with spatial and UMAP views, gene search and gene expression maps along with violin plots. Using deconvolve_reference.py HTML dashboard can apply resulting cell types to specific data. Deconvolution is based on a representative file available at the NCBI GEO. Notice: the project was developed to work with Visium data and used specifically Human Lung Cancer (FFPE), but may be adapted to other data as well. 
+A self-contained HTML report with spatial and UMAP views, gene search and gene expression maps along with violin plots. Using deconvolve_reference.py HTML dashboard can apply resulting cell types to specific data. Deconvolution is based on a representative file available at the NCBI GEO (GSE127465). Notice: the project was developed to work with Visium data and used specifically Human Lung Cancer (FFPE), but may be adapted to other data as well. 
 
 Built with **Scanpy**, **Squidpy**, **Plotly**, and **Pandas**.
 
