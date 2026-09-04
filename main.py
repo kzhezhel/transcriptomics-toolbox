@@ -66,7 +66,6 @@ spatial_archive = spatial_files[0]
 print(f"Using h5: {os.path.basename(h5_file)}")
 print(f"Using spatial: {os.path.basename(spatial_archive)}")
 
-# Распаковка spatial-архива, если ещё не распакован
 spatial_dir = os.path.join(data_dir, "spatial")
 if not os.path.exists(spatial_dir) or len(os.listdir(spatial_dir)) == 0:
     print("Extracting spatial archive...")
