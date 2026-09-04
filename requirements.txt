@@ -1,0 +1,7 @@
+scanpy>=1.9
+squidpy>=1.2
+numpy>=1.22
+pandas>=1.4
+plotly>=5.0
+Pillow>=9.0
+scipy>=1.8
