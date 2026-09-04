@@ -1,0 +1,875 @@
+import scanpy as sc
+import squidpy as sq
+import pandas as pd
+import numpy as np
+import tarfile
+import os
+import glob
+import warnings
+import plotly.express as px
+import plotly.graph_objects as go
+import webbrowser
+from PIL import Image
+import base64
+from io import BytesIO
+import json
+import argparse
+
+warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore", message="The `igraph` implementation of leiden clustering")
+
+parser = argparse.ArgumentParser(
+    description="Generate interactive spatial transcriptomics dashboard (3-island) from Visium data."
+)
+parser.add_argument(
+    "--data_dir",
+    type=str,
+    default=".",
+    help="Path to the directory containing the .h5 and spatial archive files (default: current directory)."
+)
+parser.add_argument(
+    "--output",
+    type=str,
+    default="three_islands_dashboard.html",
+    help="Output HTML file name (default: three_islands_dashboard.html)."
+)
+parser.add_argument(
+    "--gene",
+    type=str,
+    default="SOX2",
+    help="Default gene to display (must exist in the dataset)."
+)
+args = parser.parse_args()
+
+data_dir = os.path.abspath(args.data_dir)
+output_file = args.output
+default_gene = args.gene
+
+print(f"Looking for data in: {data_dir}")
+
+# File search
+
+h5_files = glob.glob(os.path.join(data_dir, "*filtered_feature_bc_matrix.h5"))
+spatial_files = glob.glob(os.path.join(data_dir, "*spatial*.tar.gz")) + glob.glob(
+    os.path.join(data_dir, "*spatial*.gz")
+)
+
+if not h5_files or not spatial_files:
+    raise FileNotFoundError(
+        f"No .h5 or spatial archive found in {data_dir}.\n"
+        "Please ensure you have exactly one *filtered_feature_bc_matrix.h5 "
+        "and one *spatial*.tar.gz (or .gz) file."
+    )
+
+h5_file = h5_files[0]
+spatial_archive = spatial_files[0]
+print(f"Using h5: {os.path.basename(h5_file)}")
+print(f"Using spatial: {os.path.basename(spatial_archive)}")
+
+# Распаковка spatial-архива, если ещё не распакован
+spatial_dir = os.path.join(data_dir, "spatial")
+if not os.path.exists(spatial_dir) or len(os.listdir(spatial_dir)) == 0:
+    print("Extracting spatial archive...")
+    os.makedirs(spatial_dir, exist_ok=True)
+    with tarfile.open(spatial_archive, "r:*") as tar:
+        tar.extractall(path=spatial_dir)
+    print("Done.")
+else:
+    print("Using existing spatial directory.")
+
+# Filtering data
+
+warnings.filterwarnings("ignore", message="Variable names are not unique", category=UserWarning)
+adata = sq.read.visium(spatial_dir, counts_file=os.path.basename(h5_file))
+warnings.resetwarnings()
+adata.var_names_make_unique()
+
+print(f"Loaded {adata.n_obs} spots, {adata.n_vars} genes")
+
+if default_gene not in adata.var_names:
+    raise ValueError(f"Gene '{default_gene}' not found in the dataset. Available genes: {list(adata.var_names[:10])}...")
+
+sc.pp.filter_cells(adata, min_genes=200)
+sc.pp.filter_genes(adata, min_cells=3)
+sc.pp.highly_variable_genes(adata, n_top_genes=2000, flavor="seurat_v3")
+adata.raw = adata.copy()
+adata = adata[:, adata.var.highly_variable].copy()
+sc.pp.normalize_total(adata, target_sum=1e8)
+sc.pp.log1p(adata)
+adata.X = adata.X / np.log(2)
+sc.pp.scale(adata, max_value=10)
+adata.X = adata.X.astype(np.float32)
+
+sc.tl.pca(adata, svd_solver="arpack")
+sc.pp.neighbors(adata, n_neighbors=10, n_pcs=30)
+sc.tl.leiden(adata, resolution=0.54, key_added="leiden", flavor="leidenalg")
+sc.tl.umap(adata)
+
+# Uploading predicted cell types
+deconv_file = os.path.join(data_dir, "lung_cancer_deconvolved_nnls.h5ad")
+if os.path.exists(deconv_file):
+    adata_deconv = sc.read(deconv_file)
+    if (adata.obs_names == adata_deconv.obs_names).all():
+        adata.obs['pred_cell_type'] = adata_deconv.obs['pred_cell_type'].values
+    else:
+        adata.obs['pred_cell_type'] = 'Unknown'
+else:
+    adata.obs['pred_cell_type'] = 'Unknown'
+
+
+# Coordinates and imaging
+
+library_id = list(adata.uns['spatial'].keys())[0]
+scalefactor = adata.uns['spatial'][library_id]['scalefactors']['tissue_lowres_scalef']
+lowres_path = os.path.join(spatial_dir, 'spatial', 'tissue_lowres_image.png')
+img = Image.open(lowres_path)
+img_width, img_height = img.size
+print(f"Lowres image size: {img_width} x {img_height}")
+
+img_buffer = BytesIO()
+img.save(img_buffer, format='PNG')
+img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+
+coords = adata.obsm['spatial'] * scalefactor
+coords[:, 1] = img_height - coords[:, 1]
+
+if 'in_tissue' in adata.obs:
+    tissue_mask = adata.obs['in_tissue'].astype(bool)
+    coords_tissue = coords[tissue_mask]
+    obs_tissue = adata.obs[tissue_mask]
+else:
+    tissue_mask = np.ones(adata.n_obs, dtype=bool)
+    coords_tissue = coords
+    obs_tissue = adata.obs
+
+lib_size = adata.obs['total_counts'].values if 'total_counts' in adata.obs else np.array(
+    adata.raw.X.sum(axis=1)
+).flatten()
+lib_size_tissue = lib_size[tissue_mask]
+
+def get_log2_cpm(gene_name):
+    if gene_name not in adata.raw.var_names:
+        return None
+    raw_exp = adata.raw[:, gene_name].X.toarray().flatten()
+    cpm = raw_exp / lib_size * 1e4
+    log2_cpm = np.log2(cpm + 1)
+    return log2_cpm[tissue_mask]
+
+additional_genes = ['EGFR', 'EPCAM', 'PTPRC', 'CD8A', 'MKI67']
+available_additional = [g for g in additional_genes if g in adata.raw.var_names]
+all_available_genes = [default_gene] + available_additional
+
+gene_data = {}
+for gene in all_available_genes:
+    expr = get_log2_cpm(gene)
+    if expr is not None:
+        gene_data[gene] = expr.tolist()
+    else:
+        gene_data[gene] = [0.0] * len(coords_tissue)
+
+gene_names_js = list(gene_data.keys())
+
+# Data for Java
+
+clusters = sorted(obs_tissue['leiden'].unique())
+colors_plotly = px.colors.qualitative.Plotly
+cluster_colors = {cl: colors_plotly[i % len(colors_plotly)] for i, cl in enumerate(clusters)}
+
+cluster_counts = obs_tissue['leiden'].value_counts()
+total_cells = len(obs_tissue)
+cluster_info = {cl: {'count': int(cluster_counts[cl]), 'percent': (cluster_counts[cl] / total_cells) * 100} for cl in clusters}
+
+spatial_coords = coords_tissue
+umap_coords = adata.obsm['X_umap'][tissue_mask]
+
+umap_x_min, umap_x_max = umap_coords[:, 0].min(), umap_coords[:, 0].max()
+umap_y_min, umap_y_max = umap_coords[:, 1].min(), umap_coords[:, 1].max()
+umap_padding = 0.1
+umap_x_range = [
+    umap_x_min - umap_padding * (umap_x_max - umap_x_min),
+    umap_x_max + umap_padding * (umap_x_max - umap_x_min)
+]
+umap_y_range = [
+    umap_y_min - umap_padding * (umap_y_max - umap_y_min),
+    umap_y_max + umap_padding * (umap_y_max - umap_y_min)
+]
+umap_x_range = [float(x) for x in umap_x_range]
+umap_y_range = [float(y) for y in umap_y_range]
+
+coords_spatial_js = spatial_coords.tolist()
+coords_umap_js = umap_coords.tolist()
+clusters_js = [str(cl) for cl in obs_tissue['leiden'].tolist()]
+cluster_colors_js = [cluster_colors[cl] for cl in obs_tissue['leiden'].tolist()]
+unique_clusters_js = [str(c) for c in clusters]
+
+hover_texts_cluster = []
+for i, cl in enumerate(obs_tissue['leiden']):
+    info = cluster_info[cl]
+    cell_type = obs_tissue['pred_cell_type'].iloc[i]
+    hover_texts_cluster.append(
+        f"Cluster: {cl}<br>Cells: {info['count']} ({info['percent']:.1f}%)<br>Type: {cell_type}"
+    )
+
+cell_types_list = obs_tissue['pred_cell_type'].tolist()
+
+
+# HTML Generation
+
+html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3-Island Spatial Transcriptomics Dashboard</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+    <script src="https://cdn.plot.ly/plotly-3.0.1.min.js" charset="utf-8"></script>
+    <style>
+        /* (стили CSS без изменений, можно убрать комментарии на русском) */
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            background-color: #e4ecf6;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            position: relative;
+        }}
+        .island {{
+            background-color: white;
+            border-radius: 20px;
+            position: absolute;
+            box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+        }}
+        .island-left {{
+            left: 24px;
+            top: 24px;
+            bottom: 24px;
+            width: 125px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 30px;
+            padding: 20px;
+        }}
+        .island-bottom {{
+            left: 161px;
+            right: 24px;
+            bottom: 24px;
+            height: 240px;
+            background: white;
+            border-radius: 20px;
+            overflow: auto;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end; 
+        }}
+        #violin-container {{
+            height: 85% !important;
+            margin: 0 0;
+        }}
+        .island-right {{
+            right: 24px;
+            top: 24px;
+            left: 161px;
+            width: calc(100% - 161px - 24px);
+            height: 530px;
+            background-color: white;
+            border-radius: 20px;
+            overflow: hidden;
+            position: relative;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }}
+        .btn {{
+            width: 100%;
+            padding: 14px 0;
+            background-color: white;
+            border-radius: 20px;
+            cursor: pointer;
+            font-size: 18px;
+            font-weight: bold;
+            text-align: center;
+            transition: all 0.25s ease;
+            color: #2c3e66;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            border: none;
+        }}
+        .btn i {{ font-size: 36px; transition: color 0.25s ease; }}
+        .btn:hover {{ background-color: #2c3e66; color: white; }}
+        .btn:hover i {{ color: white; }}
+        .btn:active {{ transform: scale(0.97); }}
+        .plot-container {{ width: 100%; height: 100%; }}
+        .opacity-slider-container {{
+            position: absolute;
+            bottom: 15px;
+            right: 15px;
+            background: white;
+            padding: 8px 12px;
+            border-radius: 20px;
+            z-index: 30;
+            text-align: center;
+            font-size: 12px;
+            font-weight: bold;
+            color: #1a3b5d;
+            pointer-events: auto;
+            display: none;
+        }}
+        .opacity-slider-container input {{ width: 100%; margin-top: 5px; }}
+        input[type="range"] {{
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 15px;
+            background: linear-gradient(90deg, #add8e6, #2c3e66);
+            border-radius: 5px;
+            outline: none;
+            cursor: pointer;
+        }}
+        input[type="range"]::-webkit-slider-thumb {{
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: #2c3e66;
+            border: 2px solid white;
+            cursor: pointer;
+        }}
+        .toggle-switch {{
+            position: absolute;
+            top: 15px;
+            right: 15px;
+            background: white;
+            border-radius: 30px;
+            padding: 5px;
+            display: flex;
+            gap: 5px;
+            z-index: 40;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+        }}
+        .toggle-btn {{
+            padding: 6px 14px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: bold;
+            transition: 0.2s;
+            background: white;
+            color: #2c3e66;
+        }}
+        .toggle-btn.active {{
+            background: #2c3e66;
+            color: white;
+        }}
+        .custom-colorbar {{
+            position: absolute;
+            left: 260px;
+            top: 15px;
+            bottom: 15px;
+            width: 50px;
+            background: white;
+            border-radius: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            z-index: 20;
+            pointer-events: none;
+        }}
+        .violin-label {{
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: white;
+            border-radius: 30px;
+            padding: 6px 14px;
+            font-size: 13px;
+            font-weight: bold;
+            color: #2c3e66;
+            border: 1px solid #2c3e66;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            z-index: 45;
+            white-space: nowrap;
+        }}
+        .gradient-bar {{
+            width: 20px;
+            flex-grow: 1;
+            background: linear-gradient(180deg, #fde725, #5dc963, #21908c, #3b528b, #440154);
+            border-radius: 10px;
+            margin: 8px 0;
+        }}
+        .colorbar-label {{
+            font-size: 15px;
+            text-align: center;
+            line-height: 1.2;
+            color:#2c3e66;
+        }}
+        .gene-search {{
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: #2c3e66;
+            border-radius: 30px;
+            padding: 6px 12px;
+            z-index: 40;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            font-size: 13px;
+            display: none;
+            align-items: center;
+            gap: 8px;
+        }}
+        .gene-search input {{
+            border: 1px solid #2c3e66;
+            border-radius: 20px;
+            padding: 5px 10px;
+            font-size: 13px;
+            width: 150px;
+            outline: none;
+            color: #2c3e66;
+        }}
+        .gene-search label {{
+            font-weight: bold;
+            color: white;
+        }}
+        .gene-dropdown {{
+            position: absolute;
+            top: 100%;
+            left: 0;
+            right: 0;
+            background: white;
+            border: 1px solid #2c3e66;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+            z-index: 100;
+            display: none;
+            margin-top: 4px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }}
+        .gene-dropdown div {{
+            padding: 6px 12px;
+            cursor: pointer;
+            color: #2c3e66;
+            font-size: 13px;
+        }}
+        .gene-dropdown div:hover {{
+            background-color: #e4ecf6;
+        }}
+        .pipeline-label {{
+            position: absolute;
+            top: 15px;
+            left: 15px;
+            background: white;
+            border-radius: 30px;
+            padding: 6px 14px;
+            font-size: 13px;
+            font-weight: bold;
+            color: #2c3e66;
+            border: 1px solid #2c3e66;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+            z-index: 45;
+            white-space: nowrap;
+            display: none;
+        }}
+        @media (max-width: 700px) {{
+            .island-left {{ width: 180px; padding: 30px 12px; gap: 20px; }}
+            .island-bottom {{ left: 224px; height: 200px; }}
+            .island-right {{ width: calc(100% - 224px - 48px); height: 280px; }}
+            .btn {{ font-size: 14px; padding: 10px 0; }}
+            .btn i {{ font-size: 18px; }}
+            .toggle-btn {{ padding: 4px 10px; font-size: 11px; }}
+            .custom-colorbar {{ width: 40px; left: 220px; }}
+            .gene-search input {{ width: 100px; }}
+            .pipeline-label {{ font-size: 10px; padding: 4px 10px; white-space: normal; max-width: 150px; }}
+            .violin-label {{ font-size: 10px; padding: 4px 10px; white-space: normal; max-width: 150px; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="island island-left">
+        <div class="btn" id="btn-clusters"><i class="fas fa-braille"></i> Clusters</div>
+        <div class="btn" id="btn-feature"><i class="fas fa-dna"></i> Feature</div>
+        <div class="btn" id="btn-patch"><i class="fas fa-puzzle-piece"></i> Patch</div>
+    </div>
+    <div class="island island-bottom">
+        <div id="violin-container" style="width:100%; height:100%;"></div>
+        <div id="violin-label" class="violin-label">Violin Plots</div>
+    </div>
+    <div class="island island-right">
+        <div id="image-container" class="plot-container" style="display: flex; align-items: center; justify-content: center;">
+            <img src="data:image/png;base64,{img_base64}" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+        </div>
+        <div id="plotly-container" class="plot-container" style="display: none;"></div>
+        <div id="opacity-slider-container" class="opacity-slider-container">
+            <label>Opacity</label>
+            <input type="range" id="opacity-slider" min="0" max="1" step="0.01" value="0.7">
+            <span id="opacity-value">0.70</span>
+        </div>
+        <div id="toggle-switch" class="toggle-switch">
+            <div class="toggle-btn active" data-proj="spatial">Spatial</div>
+            <div class="toggle-btn" data-proj="umap">UMAP</div>
+        </div>
+        <div id="custom-colorbar" class="custom-colorbar" style="display: none;">
+            <div class="colorbar-label" id="colorbar-title" style="font-weight: bold;">{default_gene} log2</div>
+            <div class="gradient-bar"></div>
+            <div class="colorbar-label" id="colorbar-max">0.0</div>
+            <div class="colorbar-label" id="colorbar-min">0.0</div>
+        </div>
+        <div id="gene-search" class="gene-search">
+            <label>Gene:</label>
+            <div style="position: relative;">
+                <input type="text" id="gene-input" placeholder="Type gene name..." autocomplete="off">
+                <div id="gene-dropdown" class="gene-dropdown"></div>
+            </div>
+        </div>
+        <div id="pipeline-label" class="pipeline-label">Pipeline-generated groups</div>
+    </div>
+    <script>
+        // Data from Python
+        var spatialCoords = {json.dumps(coords_spatial_js)};
+        var umapCoords = {json.dumps(coords_umap_js)};
+        var clusters = {json.dumps(clusters_js)};
+        var clusterColors = {json.dumps(cluster_colors_js)};
+        var uniqueClusters = {json.dumps(unique_clusters_js)};
+        var imgWidth = {img_width};
+        var imgHeight = {img_height};
+        var umapXRange = {umap_x_range};
+        var umapYRange = {umap_y_range};
+        var clusterHoverTexts = {json.dumps(hover_texts_cluster)};
+        var cellTypes = {json.dumps(cell_types_list)};
+        var geneData = {json.dumps(gene_data)};
+        var geneNames = {json.dumps(gene_names_js)};
+
+        var currentGene = '{default_gene}';
+        var clusterColorMap = {{}};
+        for (var i = 0; i < uniqueClusters.length; i++) {{
+            var cl = uniqueClusters[i];
+            var idx = clusters.indexOf(cl);
+            clusterColorMap[cl] = clusterColors[idx];
+        }}
+
+        var currentMode = null;
+        var clustersProjection = 'spatial';
+        var sox2Projection = 'spatial';
+        var currentOpacity = 0.7;
+
+        function drawViolin(gene) {{
+            var expr = geneData[gene];
+            if (!expr) return;
+            var valuesByCluster = {{}};
+            for (var i = 0; i < clusters.length; i++) {{
+                var cl = clusters[i];
+                if (!valuesByCluster[cl]) valuesByCluster[cl] = [];
+                valuesByCluster[cl].push(expr[i]);
+            }}
+            var sortedClusters = uniqueClusters.slice().sort((a,b)=>Number(a)-Number(b));
+            var traces = [];
+            for (var cls of sortedClusters) {{
+                traces.push({{
+                    type: 'violin',
+                    y: valuesByCluster[cls],
+                    name: 'Cluster ' + cls,
+                    legendgroup: 'cluster_' + cls,
+                    line: {{ color: clusterColorMap[cls], width: 1.5 }},
+                    box: {{
+                        visible: true,
+                        line: {{ width: 1.5 }}
+                    }},
+                    meanline: {{
+                        visible: true,
+                        width: 1.5
+                    }},
+                    side: 'both',
+                    showlegend: false
+                }});
+                traces.push({{
+                    x: [null], y: [null],
+                    mode: 'markers',
+                    marker: {{ color: clusterColorMap[cls], size: 10, symbol: 'square' }},
+                    name: 'Cluster ' + cls,
+                    legendgroup: 'cluster_' + cls,
+                    showlegend: true,
+                    visible: false
+                }});
+            }}
+            var maxVal = Math.max(...Object.values(valuesByCluster).flat());
+            var layout = {{
+                title: {{
+                    text: gene + ' expression by cluster',
+                    font: {{ size: 14, color: '#2c3e66' }},
+                    x: 0.5
+                }},
+                xaxis: {{
+                    title: {{font: {{ color: '#2c3e66' }} }},
+                    tickfont: {{ color: '#2c3e66' }},
+                    gridcolor: '#add8e6',
+                    showgrid: false
+                }},
+                yaxis: {{
+                    title: {{ text: 'log2', font: {{ color: '#2c3e66' }} }},
+                    tickfont: {{ color: '#2c3e66' }},
+                    range: [0, maxVal + 0.5],
+                    gridcolor: '#e4ecf6'
+                }},
+                margin: {{ l: 40, r: 20, t: 40, b: 40 }},
+                paper_bgcolor: 'white',
+                plot_bgcolor: 'white',
+                legend: {{ orientation: 'h', y: -0.2, x: 0.5, xanchor: 'center' }}
+            }};
+            Plotly.newPlot('violin-container', traces, layout, {{ responsive: true, displayModeBar: false }});
+        }}
+        function setToggleState(proj) {{
+            var btns = document.querySelectorAll('.toggle-btn');
+            btns.forEach(btn => {{
+                if (btn.getAttribute('data-proj') === proj) btn.classList.add('active');
+                else btn.classList.remove('active');
+            }});
+        }}
+
+        function redraw() {{
+            if (currentMode === 'clusters') {{
+                var coords = clustersProjection === 'spatial' ? spatialCoords : umapCoords;
+                var xRange = clustersProjection === 'spatial' ? [0, imgWidth] : umapXRange;
+                var yRange = clustersProjection === 'spatial' ? [0, imgHeight] : umapYRange;
+                var showImage = clustersProjection === 'spatial';
+                var traces = [];
+                for (var cl of uniqueClusters) {{
+                    var indices = [];
+                    for (var i = 0; i < clusters.length; i++) {{
+                        if (clusters[i] === cl) indices.push(i);
+                    }}
+                    traces.push({{
+                        x: indices.map(i => coords[i][0]), y: indices.map(i => coords[i][1]),
+                        mode: 'markers', type: 'scattergl',
+                        marker: {{ size: 6, color: clusterColorMap[cl], opacity: currentOpacity }},
+                        name: 'Cluster ' + cl,
+                        text: indices.map(i => clusterHoverTexts[i]),
+                        hoverinfo: 'text',
+                        showlegend: true
+                    }});
+                }}
+                var layout = {{
+                    width: document.getElementById('plotly-container').clientWidth,
+                    height: document.getElementById('plotly-container').clientHeight,
+                    xaxis: {{ range: xRange, visible: false, scaleanchor: 'y', scaleratio: 1, autorange: false }},
+                    yaxis: {{ range: yRange, visible: false, scaleanchor: 'x', scaleratio: 1, autorange: false }},
+                    margin: {{ l: 0, r: 0, t: 0, b: 0 }},
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(0,0,0,0)',
+                    showlegend: true,
+                    legend: {{
+                        x: 0.1, y: 0.5, xanchor: 'left', yanchor: 'middle',
+                        bgcolor: 'white', bordercolor: '#ddd', borderwidth: 0,
+                        font: {{ size: 11 }}, tracegroupgap: 5, itemsizing: 'constant'
+                    }},
+                    images: showImage ? [{{
+                        source: 'data:image/png;base64,{img_base64}',
+                        xref: 'x', yref: 'y', x: 0, y: imgHeight,
+                        sizex: imgWidth, sizey: imgHeight, sizing: 'stretch', layer: 'below'
+                    }}] : []
+                }};
+                Plotly.react('plotly-container', traces, layout, {{ responsive: true, displayModeBar: 'hover' }});
+            }} else if (currentMode === 'sox2') {{
+                var coords = sox2Projection === 'spatial' ? spatialCoords : umapCoords;
+                var xRange = sox2Projection === 'spatial' ? [0, imgWidth] : umapXRange;
+                var yRange = sox2Projection === 'spatial' ? [0, imgHeight] : umapYRange;
+                var showImage = sox2Projection === 'spatial';
+                var expr = geneData[currentGene];
+                var minVal = Math.min(...expr);
+                var maxVal = Math.max(...expr);
+                var trace = {{
+                    x: coords.map(c => c[0]), y: coords.map(c => c[1]),
+                    mode: 'markers', type: 'scattergl',
+                    marker: {{
+                        size: 6, color: expr, colorscale: 'Viridis', showscale: false,
+                        opacity: currentOpacity, cmin: minVal, cmax: maxVal
+                    }},
+                    text: expr.map((val, idx) => `${{currentGene}}: ${{val.toFixed(2)}}<br>Type: ${{cellTypes[idx]}}`),
+                    hoverinfo: 'text',
+                    name: currentGene,
+                    showlegend: false
+                }};
+                var layout = {{
+                    width: document.getElementById('plotly-container').clientWidth,
+                    height: document.getElementById('plotly-container').clientHeight,
+                    xaxis: {{ range: xRange, visible: false, scaleanchor: 'y', scaleratio: 1, autorange: false }},
+                    yaxis: {{ range: yRange, visible: false, scaleanchor: 'x', scaleratio: 1, autorange: false }},
+                    margin: {{ l: 0, r: 0, t: 0, b: 0 }},
+                    paper_bgcolor: 'rgba(0,0,0,0)',
+                    plot_bgcolor: 'rgba(0,0,0,0)',
+                    showlegend: false,
+                    images: showImage ? [{{
+                        source: 'data:image/png;base64,{img_base64}',
+                        xref: 'x', yref: 'y', x: 0, y: imgHeight,
+                        sizex: imgWidth, sizey: imgHeight, sizing: 'stretch', layer: 'below'
+                    }}] : []
+                }};
+                Plotly.react('plotly-container', [trace], layout, {{ responsive: true, displayModeBar: 'hover' }});
+            }}
+        }}
+
+        function switchProjection(proj) {{
+            if (currentMode === 'clusters') {{
+                clustersProjection = proj;
+                setToggleState(proj);
+                redraw();
+            }} else if (currentMode === 'sox2') {{
+                sox2Projection = proj;
+                setToggleState(proj);
+                redraw();
+            }}
+        }}
+
+        function changeGene(gene) {{
+            if (!geneData.hasOwnProperty(gene)) {{
+                console.warn("Gene not available:", gene);
+                return;
+            }}
+            currentGene = gene;
+            // update color range
+            var expr = geneData[gene];
+            var minVal = Math.min(...expr);
+            var maxVal = Math.max(...expr);
+            document.getElementById('colorbar-title').innerText = gene + ' log2 ';
+            document.getElementById('colorbar-max').innerText = maxVal.toFixed(1);
+            document.getElementById('colorbar-min').innerText = minVal.toFixed(1);
+            if (currentMode === 'sox2') {{
+                redraw();
+            }}
+            drawViolin(gene);
+        }}
+
+        function showClusters() {{
+            document.getElementById('image-container').style.display = 'none';
+            document.getElementById('plotly-container').style.display = 'block';
+            document.getElementById('opacity-slider-container').style.display = 'block';
+            document.getElementById('custom-colorbar').style.display = 'none';
+            document.getElementById('gene-search').style.display = 'none';
+            document.getElementById('pipeline-label').style.display = 'block';
+            currentMode = 'clusters';
+            setToggleState(clustersProjection);
+            redraw();
+        }}
+
+        function showSox2() {{
+            document.getElementById('image-container').style.display = 'none';
+            document.getElementById('plotly-container').style.display = 'block';
+            document.getElementById('opacity-slider-container').style.display = 'block';
+            document.getElementById('custom-colorbar').style.display = 'flex';
+            document.getElementById('gene-search').style.display = 'flex';
+            document.getElementById('pipeline-label').style.display = 'none';
+            currentMode = 'sox2';
+            setToggleState(sox2Projection);
+            updateColorbar(currentGene);
+            redraw();
+            drawViolin(currentGene);
+        }}
+
+        function showImage() {{
+            document.getElementById('image-container').style.display = 'flex';
+            document.getElementById('plotly-container').style.display = 'none';
+            document.getElementById('opacity-slider-container').style.display = 'none';
+            document.getElementById('custom-colorbar').style.display = 'none';
+            document.getElementById('gene-search').style.display = 'none';
+            document.getElementById('pipeline-label').style.display = 'none';
+            currentMode = null;
+        }}
+
+        function updateOpacity() {{
+            var slider = document.getElementById('opacity-slider');
+            currentOpacity = parseFloat(slider.value);
+            document.getElementById('opacity-value').innerText = currentOpacity.toFixed(2);
+            if (currentMode === 'clusters') {{
+                var indices = [];
+                for (var i = 0; i < uniqueClusters.length; i++) indices.push(i);
+                Plotly.restyle('plotly-container', {{ 'marker.opacity': currentOpacity }}, indices);
+            }} else if (currentMode === 'sox2') {{
+                Plotly.restyle('plotly-container', {{ 'marker.opacity': currentOpacity }}, [0]);
+            }}
+        }}
+
+        function updateColorbar(gene) {{
+            var expr = geneData[gene];
+            var minVal = Math.min(...expr);
+            var maxVal = Math.max(...expr);
+            document.getElementById('colorbar-title').innerText = gene + ' log2';
+            document.getElementById('colorbar-max').innerText = maxVal.toFixed(1);
+            document.getElementById('colorbar-min').innerText = minVal.toFixed(1);
+        }}
+
+        // Gene search
+        var geneInput = document.getElementById('gene-input');
+        var geneDropdown = document.getElementById('gene-dropdown');
+        var allGeneNames = geneNames;
+
+        function filterGenes(searchText) {{
+            var searchLower = searchText.toLowerCase();
+            return allGeneNames.filter(g => g.toLowerCase().includes(searchLower));
+        }}
+        function showDropdown(items) {{
+            geneDropdown.innerHTML = '';
+            if (items.length === 0) {{
+                geneDropdown.style.display = 'none';
+                return;
+            }}
+            items.forEach(item => {{
+                var div = document.createElement('div');
+                div.textContent = item;
+                div.addEventListener('click', function() {{
+                    geneInput.value = item;
+                    geneDropdown.style.display = 'none';
+                    changeGene(item);
+                }});
+                geneDropdown.appendChild(div);
+            }});
+            geneDropdown.style.display = 'block';
+        }}
+        geneInput.addEventListener('input', function() {{
+            var filtered = filterGenes(this.value);
+            showDropdown(filtered);
+        }});
+        geneInput.addEventListener('blur', function() {{
+            setTimeout(() => {{ geneDropdown.style.display = 'none'; }}, 200);
+        }});
+        geneInput.addEventListener('keydown', function(e) {{
+            if (e.key === 'Enter' && geneDropdown.children.length > 0) {{
+                var firstOption = geneDropdown.children[0];
+                geneInput.value = firstOption.textContent;
+                geneDropdown.style.display = 'none';
+                changeGene(firstOption.textContent);
+            }}
+        }});
+        geneInput.value = '{default_gene}';
+
+        window.addEventListener('load', function() {{
+            document.getElementById('btn-clusters').onclick = showClusters;
+            document.getElementById('btn-feature').onclick = showSox2;
+            document.getElementById('btn-patch').onclick = showImage;
+            document.getElementById('opacity-slider').addEventListener('input', updateOpacity);
+            document.querySelectorAll('.toggle-btn').forEach(btn => {{
+                btn.addEventListener('click', function() {{
+                    switchProjection(this.getAttribute('data-proj'));
+                }});
+            }});
+            window.addEventListener('resize', function() {{
+                if (document.getElementById('plotly-container').style.display === 'block') redraw();
+            }});
+            showImage();
+        }});
+    </script>
+</body>
+</html>
+"""
+
+# Save and open
+with open(output_file, "w", encoding="utf-8") as f:
+    f.write(html_content)
+
+print(f"HTML dashboard saved to: {output_file}")
+webbrowser.open("file://" + os.path.abspath(output_file))
