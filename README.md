@@ -2,6 +2,7 @@
 Interactive spatial transcriptomics dashboard for Visium data with cluster/gene expression views, UMAP switching, gene finder and violin plot function.
 
 # Spatial Transcriptomics Toolbox
+<img width="2940" height="1677" alt="image" src="https://github.com/user-attachments/assets/6b9115fc-02af-46d8-860b-9fb971fa4363" />
 
 ## About
 
